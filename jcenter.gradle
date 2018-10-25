@@ -1,0 +1,170 @@
+apply plugin: 'maven-publish'
+apply plugin: 'com.jfrog.bintray'
+
+version = libraryVersion
+group = groupId
+
+// Utility method to extract only one entry in a zip file
+private def extractEntry(archive, entryPath, outputPath) {
+    if (!archive.exists()) {
+        throw new GradleException("archive $archive not found")
+    }
+
+    def zip = new java.util.zip.ZipFile(archive)
+
+    zip.entries().each {
+        if (it.name == entryPath) {
+            def path = new File(outputPath)
+
+            if (!path.exists()) {
+                path.getParentFile().mkdirs()
+
+                // Surely there's a simpler is->os utility except
+                // the one in java.nio.Files? Ah well...
+                def buf = new byte[1024]
+                def is = zip.getInputStream(it)
+                def os = new FileOutputStream(path)
+                def len
+
+                while ((len = is.read(buf)) != -1) {
+                    os.write(buf, 0, len)
+                }
+                os.close()
+            }
+        }
+    }
+    zip.close()
+}
+
+if (project.hasProperty("android")) { // Android libraries
+    task sourcesJar(type: Jar) {
+        classifier = 'sources'
+        from android.sourceSets.main.java.srcDirs
+    }
+
+    task javadoc(type: Javadoc) {
+        failOnError false
+        source = android.sourceSets.main.java.srcDirs
+        // Also add the generated R class to avoid errors...
+        // TODO: debug is hard-coded
+        source += "$buildDir/generated/source/r/debug/"
+        // ... but exclude the R classes from the docs
+        excludes += "**/R.java"
+
+        // TODO: "compile" is deprecated in Gradle 4.1,
+        // but "implementation" and "api" are not resolvable :(
+        classpath += configurations.compile
+
+        afterEvaluate {
+            // Wait after evaluation to add the android classpath
+            // to avoid "buildToolsVersion is not specified" error
+            classpath += files(android.getBootClasspath())
+
+            // Process AAR dependencies
+            def aarDependencies = classpath.filter { it.name.endsWith('.aar') }
+            classpath -= aarDependencies
+            aarDependencies.each { aar ->
+                System.out.println("Adding classpath for aar: " + aar.name)
+                // Extract classes.jar from the AAR dependency, and add it to the javadoc classpath
+                def outputPath = "$buildDir/tmp/exploded-aar/${aar.name.replace('.aar', '.jar')}"
+                classpath += files(outputPath)
+
+                // Use a task so the actual extraction only happens before the javadoc task is run
+                dependsOn task(name: "extract ${aar.name}").doLast {
+                    extractEntry(aar, 'classes.jar', outputPath)
+                }
+            }
+        }
+    }
+} else { // Java libraries
+    task sourcesJar(type: Jar, dependsOn: classes) {
+        classifier = 'sources'
+        from sourceSets.main.allSource
+    }
+}
+
+task javadocJar(type: Jar, dependsOn: javadoc) {
+    classifier = 'javadoc'
+    from javadoc.destinationDir
+}
+
+artifacts {
+    archives javadocJar
+    archives sourcesJar
+}
+
+// Bintray
+
+publishing {
+    publications {
+        MyPublication(MavenPublication) {
+            groupId groupId
+            artifactId artifactId
+            version libraryVersion
+
+            artifact(sourcesJar)
+            artifact(javadocJar)
+            artifact(bundleRelease)
+
+            //The publication doesn't know about our dependencies, so we have to manually add them to the pom
+            pom.withXml {
+                def dependenciesNode = asNode().appendNode('dependencies')
+
+                //Iterate over the compile dependencies (we don't want the test ones), adding a <dependency> node for each
+                configurations.compile.allDependencies.each {
+                    if (it.group != null && (it.name != null && "unspecified" != it.name) && it.version != null) {
+                        def dependencyNode = dependenciesNode.appendNode('dependency')
+                        dependencyNode.appendNode('groupId', it.group)
+                        dependencyNode.appendNode('artifactId', it.name)
+                        dependencyNode.appendNode('version', it.version)
+                    }
+                }
+                configurations.api.allDependencies.each {
+                    if (it.group != null && (it.name != null && "unspecified" != it.name) && it.version != null) {
+                        def dependencyNode = dependenciesNode.appendNode('dependency')
+                        dependencyNode.appendNode('groupId', it.group)
+                        dependencyNode.appendNode('artifactId', it.name)
+                        dependencyNode.appendNode('version', it.version)
+                    }
+                }
+            }
+        }
+    }
+
+    repositories {
+        maven {
+            credentials {
+                username System.getenv('NEXUS_USERNAME')
+                password System.getenv('NEXUS_PASSWORD')
+            }
+            url version.endsWith('-SNAPSHOT') ? System.getenv('NEXUS_SNAPSHOTS_URL') : System.getenv('NEXUS_RELEASES_URL')
+        }
+    }
+}
+
+bintray {
+    user = System.getenv("BINTRAY_USER")
+    key = System.getenv("BINTRAY_KEY") // from profile page -> edit
+
+    publications = ['MyPublication']
+    configurations = ['archives']
+    pkg {
+        repo = bintrayRepo
+        name = bintrayName
+        userOrg = System.getenv("BINTRAY_ORG") != null ? System.getenv("BINTRAY_ORG") : System.getenv("BINTRAY_USER")
+        desc = libraryDescription
+        websiteUrl = siteUrl
+        vcsUrl = gitUrl
+        licenses = allLicenses
+        publish = true
+        publicDownloadNumbers = true
+        version {
+            desc = libraryDescription
+            gpg {
+                sign = true //Determines whether to GPG sign the files. The default is false
+                passphrase = System.getenv("BINTRAY_GPG_PASSWORD")
+                //Optional. The passphrase for GPG signing'
+            }
+        }
+    }
+}
